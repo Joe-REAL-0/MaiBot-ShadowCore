@@ -277,6 +277,36 @@ class ChatConfig(ConfigBase):
     _wrap_思考频率规则列表，支持按聊天流/按日内时段配置。
     """
 
+    max_active_topic_queues: int = Field(
+        default=8,
+        ge=2,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "list-tree",
+        },
+    )
+    """活跃话题队列最大数量，达到上限时淘汰最不活跃的话题"""
+
+    topic_queue_max_idle_minutes: int = Field(
+        default=30,
+        ge=1,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "clock",
+        },
+    )
+    """话题队列最大空闲时间（分钟），超过后自动总结归档"""
+
+    topic_queue_max_messages_per_queue: int = Field(
+        default=200,
+        ge=10,
+        json_schema_extra={
+            "x-widget": "input",
+            "x-icon": "rows-3",
+        },
+    )
+    """单个话题队列最大消息数量，超过后滚动丢弃最旧消息"""
+
 
 class MessageReceiveConfig(ConfigBase):
     """消息接收配置类"""

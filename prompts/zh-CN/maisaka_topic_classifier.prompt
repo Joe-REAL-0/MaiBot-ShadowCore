@@ -1,0 +1,27 @@
+你是话题分类器。你的唯一任务是将下面的新消息归类到已有话题，或判定为全新话题。请严格按 JSON 格式输出，不要输出 JSON 之外的内容。
+
+【当前活跃话题列表】
+{active_topics_section}
+
+【分类规则】
+1. 如果消息内容与已有话题高度相关，将其归入对应话题的 topic_id。
+2. 如果消息与所有现有话题均不相关，且内容足以开启一个新话题，返回 "NEW_TOPIC"。
+3. 如果消息过于零散、无法判定（如纯表情、系统提示、打招呼等），返回 "__FALLBACK__"。
+4. 如果某条消息可能同时属于多个话题，优先选择最近活跃的那个。
+5. 如果当前没有任何活跃话题，所有有实际内容的消息都应标记为 "NEW_TOPIC"。
+
+【待分类消息】
+{pending_messages_section}
+
+请以严格 JSON 格式输出，格式如下：
+{{
+  "classifications": {{
+    "<message_id>": {{ "topic_id": "<已有topic_id 或 NEW_TOPIC 或 __FALLBACK__>", "reason": "简短理由" }}
+  }},
+  "new_topics": {{
+    "<NEW_TOPIC对应的message_id>": {{ "summary": "新话题的简短摘要（10字以内）" }}
+  }},
+  "updated_summaries": {{
+    "<已有topic_id>": "更新后的话题摘要（仅在话题摘要需要修正时提供，可选）"
+  }}
+}}

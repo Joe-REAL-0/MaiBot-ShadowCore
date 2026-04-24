@@ -611,8 +611,15 @@ class MaisakaChatLoopService:
         enable_visual_message: Optional[bool] = None,
         request_kind: str = "planner",
         max_context_size: Optional[int] = None,
+        target_topic_id: Optional[str] = None,
     ) -> tuple[List[LLMContextMessage], str]:
-        """选择LLM上下文消息"""
+        """选择LLM上下文消息
+
+        当 target_topic_id 为 None 或 FALLBACK 时，沿用原有逻辑从全局历史中选取。
+        未来阶段中，若指定了具体 topic_id，则仅从对应 TopicQueue 中选取上下文。
+
+        阶段一：无论 target_topic_id 为何值，统一使用全局历史（兜底行为）。
+        """
 
         filtered_history = MaisakaChatLoopService._filter_history_for_request_kind(
             chat_history,

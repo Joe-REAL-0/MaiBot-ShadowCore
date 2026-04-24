@@ -1,4 +1,4 @@
-﻿"""Maisaka 非 CLI 运行时。"""
+"""Maisaka 非 CLI 运行时。"""
 
 from collections import deque
 from datetime import datetime
@@ -43,6 +43,7 @@ from .reply_effect import ReplyEffectTracker
 from .reply_effect.image_utils import extract_visual_attachments_from_sequence
 from .reply_effect.quote_utils import extract_quote_target_ids, message_id_from_context_message
 from .tool_provider import MaisakaBuiltinToolProvider
+from .topic_queue import TopicManager
 
 logger = get_logger("maisaka_runtime")
 
@@ -71,6 +72,7 @@ class MaisakaHeartFlowChatting:
             is_group_chat=self.chat_stream.is_group_session,
         )
         self._chat_history: list[LLMContextMessage] = []
+        self._topic_manager = TopicManager()
         self.history_loop: list[CycleDetail] = []
 
         # Keep all original messages for batching and later learning.
@@ -85,6 +87,7 @@ class MaisakaHeartFlowChatting:
         self._running = False
         self._cycle_counter = 0
         self._internal_loop_task: Optional[asyncio.Task] = None
+        self._topic_gc_task: Optional[asyncio.Task[None]] = None
         self._message_turn_scheduled = False
         self._deferred_message_turn_task: Optional[asyncio.Task[None]] = None
         self._message_debounce_seconds = 1.0
@@ -161,6 +164,7 @@ class MaisakaHeartFlowChatting:
 
         self._running = True
         self._ensure_background_tasks_running()
+        self._start_topic_gc_task()
         self._schedule_message_turn()
         self._update_stage_status("空闲", "等待消息触发")
         logger.info(f"{self.log_prefix} Maisaka 运行时已启动")
@@ -189,12 +193,77 @@ class MaisakaHeartFlowChatting:
 
         if self._is_reply_effect_tracking_enabled():
             await self._reply_effect_tracker.finalize_all("runtime_stop")
+        self._cancel_topic_gc_task()
         await self._tool_registry.close()
         self._mcp_manager = None
         self._mcp_host_bridge = None
         remove_stage_status(self.session_id)
 
         logger.info(f"{self.log_prefix} Maisaka 运行时已停止")
+
+    # ------------------------------------------------------------------
+    # 阶段四：话题队列 GC 后台定时任务
+    # ------------------------------------------------------------------
+
+    def _start_topic_gc_task(self) -> None:
+        """启动话题队列 GC 后台任务。"""
+        if self._topic_gc_task is not None and not self._topic_gc_task.done():
+            return
+        self._topic_gc_task = asyncio.create_task(self._run_topic_gc_loop())
+        logger.debug(f"{self.log_prefix} 话题队列 GC 后台任务已启动")
+
+    def _cancel_topic_gc_task(self) -> None:
+        """取消话题队列 GC 后台任务。"""
+        if self._topic_gc_task is None:
+            return
+        self._topic_gc_task.cancel()
+        self._topic_gc_task = None
+
+    async def _run_topic_gc_loop(self) -> None:
+        """后台定时任务：周期性检查并清理超过空闲时限的话题队列。
+
+        每 60 秒扫描一次，将超过配置的 topic_queue_max_idle_minutes
+        的活跃话题执行总结并归档。
+        """
+        gc_interval_seconds = 60
+        try:
+            while self._running:
+                await asyncio.sleep(gc_interval_seconds)
+                if not self._running:
+                    break
+
+                try:
+                    max_idle_minutes = max(
+                        1, int(global_config.chat.topic_queue_max_idle_minutes)
+                    )
+                    expired_topics = self._topic_manager.get_expired_topics(
+                        max_idle_minutes
+                    )
+                    if not expired_topics:
+                        continue
+
+                    logger.info(
+                        f"{self.log_prefix} 话题 GC 扫描发现 {len(expired_topics)} 个过期话题"
+                    )
+                    for topic in expired_topics:
+                        if not self._running:
+                            break
+                        logger.info(
+                            f"{self.log_prefix} 话题 GC 归档超时话题: "
+                            f"topic_id={topic.topic_id}, "
+                            f"summary={topic.summary!r}, "
+                            f"空闲时间={(datetime.now() - topic.last_active).total_seconds() / 60:.1f}分钟"
+                        )
+                        await self._reasoning_engine._summarize_and_archive_topic(
+                            topic.topic_id, self._topic_manager
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"{self.log_prefix} 话题 GC 扫描异常: {exc}"
+                    )
+        except asyncio.CancelledError:
+            logger.debug(f"{self.log_prefix} 话题队列 GC 后台任务已取消")
+            return
 
     def adjust_talk_frequency(self, frequency: float) -> None:
         """调整当前会话的回复频率倍率。"""
@@ -230,6 +299,10 @@ class MaisakaHeartFlowChatting:
                 source_kind=source_kind,
             )
             self._chat_history.append(history_message)
+            # 阶段一：所有消息默认走 FALLBACK，不分配到具体话题队列
+            self._topic_manager.assign_message(
+                TopicManager.FALLBACK_TOPIC_ID, history_message
+            )
             return True
         except Exception as exc:
             logger.warning(

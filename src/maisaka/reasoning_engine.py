@@ -1,7 +1,7 @@
 """Maisaka 推理引擎。"""
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import asyncio
 import difflib
@@ -16,6 +16,7 @@ from src.common.logger import get_logger
 from src.common.prompt_i18n import load_prompt
 from src.core.tooling import ToolAvailabilityContext, ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
 from src.llm_models.exceptions import ReqAbortException
+from src.llm_models.payload_content.resp_format import RespFormat, RespFormatType
 from src.llm_models.payload_content.tool_option import ToolCall
 from src.services import database_service as database_api
 from src.services.memory_service import memory_service
@@ -43,6 +44,15 @@ from .monitor_events import (
     emit_timing_gate_result,
 )
 from .planner_message_utils import build_planner_user_prefix_from_session_message
+from .topic_queue import (
+    ClassifierResult,
+    NEW_TOPIC_MARKER,
+    TopicManager,
+    TopicSelectionResult,
+    generate_topic_id,
+    parse_classifier_response,
+    parse_topic_selection_response,
+)
 from .visual_mode_utils import resolve_enable_visual_planner
 
 if TYPE_CHECKING:
@@ -54,6 +64,17 @@ logger = get_logger("maisaka_reasoning_engine")
 TIMING_GATE_CONTEXT_LIMIT = 24
 TIMING_GATE_MAX_TOKENS = 384
 TIMING_GATE_TOOL_NAMES = {"continue", "no_reply", "wait"}
+
+# 话题分类器常量
+TOPIC_CLASSIFIER_MAX_TOKENS = 512
+TOPIC_CLASSIFIER_CONTEXT_LIMIT = 6
+
+# Topic Selection Gate 常量
+TOPIC_SELECTION_GATE_MAX_TOKENS = 512
+TOPIC_SELECTION_GATE_CONTEXT_LIMIT = 6
+
+# 话题总结器常量
+TOPIC_SUMMARIZER_MAX_TOKENS = 512
 
 
 class MaisakaReasoningEngine:
@@ -95,8 +116,35 @@ class MaisakaReasoningEngine:
         *,
         injected_user_messages: Optional[list[str]] = None,
         tool_definitions: Optional[list[dict[str, Any]]] = None,
+        target_topic_id: Optional[str] = None,
     ) -> Any:
-        """运行一轮可被新消息打断的主 planner 请求。"""
+        """运行一轮可被新消息打断的主 planner 请求。
+
+        Args:
+            injected_user_messages: 额外注入的用户消息。
+            tool_definitions: 工具定义列表。
+            target_topic_id: 选中的话题 ID。若指定且不为 FALLBACK，
+                则使用该话题队列的消息作为上下文，实现话题级隔离。
+        """
+
+        # 阶段三：当指定了具体话题时，使用话题队列消息代替全局历史
+        effective_history: list[LLMContextMessage] = self._runtime._chat_history
+        if (
+            target_topic_id is not None
+            and target_topic_id != TopicManager.FALLBACK_TOPIC_ID
+        ):
+            topic_messages = self._runtime._topic_manager.get_topic_messages(target_topic_id)
+            if topic_messages:
+                effective_history = topic_messages
+                logger.info(
+                    f"{self._runtime.log_prefix} Planner 使用话题隔离上下文: "
+                    f"topic_id={target_topic_id}, 消息数={len(topic_messages)}"
+                )
+            else:
+                logger.warning(
+                    f"{self._runtime.log_prefix} 话题 {target_topic_id} 消息为空，"
+                    f"回退到全局历史"
+                )
 
         interrupt_flag = asyncio.Event()
         interrupted = False
@@ -104,7 +152,7 @@ class MaisakaReasoningEngine:
         self._runtime._chat_loop_service.set_interrupt_flag(interrupt_flag)
         try:
             return await self._runtime._chat_loop_service.chat_loop_step(
-                self._runtime._chat_history,
+                effective_history,
                 injected_user_messages=injected_user_messages,
                 tool_definitions=tool_definitions,
             )
@@ -380,7 +428,11 @@ class MaisakaReasoningEngine:
                         )
                 try:
                     timing_gate_required = True
+                    # 阶段三：话题级目标 ID，由 Topic Selection Gate 或 @/提及逻辑确定
+                    target_topic_id: Optional[str] = None
                     for round_index in range(self._runtime._max_internal_rounds):
+                        # 每轮循环开头重置 target_topic_id，防止上一轮的选择被意外复用
+                        target_topic_id = None
                         cycle_detail = self._start_cycle()
                         round_text = f"第 {round_index + 1}/{self._runtime._max_internal_rounds} 轮"
                         self._runtime._log_cycle_started(cycle_detail, round_index)
@@ -413,6 +465,68 @@ class MaisakaReasoningEngine:
                                 logger.info(
                                     f"{self._runtime.log_prefix} 本轮思考前已刷新 {refreshed_message_count} 条视觉占位历史消息"
                                 )
+
+                            # ----- 阶段三：Topic Selection Gate -----
+                            active_topics = self._runtime._topic_manager.get_active_topics()
+                            if timing_gate_required and active_topics:
+                                # 检查是否有 @/提及 触发，直接选择对应话题
+                                if self._runtime._force_next_timing_continue:
+                                    forced_message_id = self._runtime._force_next_timing_message_id
+                                    forced_topic_id = self._runtime._topic_manager.find_topic_for_message(
+                                        forced_message_id
+                                    )
+                                    if forced_topic_id is not None:
+                                        target_topic_id = forced_topic_id
+                                        logger.info(
+                                            f"{self._runtime.log_prefix} @/提及消息命中话题，"
+                                            f"跳过 Topic Selection Gate: "
+                                            f"topic_id={forced_topic_id}, "
+                                            f"trigger_msg={forced_message_id}"
+                                        )
+                                    else:
+                                        # @/提及消息未被分到任何话题（可能在 FALLBACK 中），
+                                        # 回退到全局历史逻辑
+                                        target_topic_id = None
+                                        logger.info(
+                                            f"{self._runtime.log_prefix} @/提及消息未命中任何话题，"
+                                            f"回退到全局历史逻辑: trigger_msg={forced_message_id}"
+                                        )
+                                else:
+                                    # 正常执行 Topic Selection Gate
+                                    self._runtime._update_stage_status(
+                                        "Topic Selection Gate", "话题兴趣筛选",
+                                        round_text=round_text,
+                                    )
+                                    selection_started_at = time.time()
+                                    selection_result = await self._run_topic_selection_gate()
+                                    cycle_detail.time_records["topic_selection_gate"] = (
+                                        time.time() - selection_started_at
+                                    )
+                                    target_topic_id = selection_result.topic_id
+                                    logger.info(
+                                        f"{self._runtime.log_prefix} Topic Selection Gate 结果: "
+                                        f"topic_id={target_topic_id}, "
+                                        f"reason={selection_result.reason!r}"
+                                    )
+
+                                    # 如果 Bot 对所有话题都不感兴趣，终止本轮
+                                    if target_topic_id is None:
+                                        logger.info(
+                                            f"{self._runtime.log_prefix} Bot 对所有话题不感兴趣，"
+                                            f"终止本轮: reason={selection_result.reason!r}"
+                                        )
+                                        break
+
+                                    # 验证选中的 topic_id 是否有效
+                                    if self._runtime._topic_manager.get_topic(target_topic_id) is None:
+                                        logger.warning(
+                                            f"{self._runtime.log_prefix} Topic Selection Gate 返回了"
+                                            f"不存在的话题 {target_topic_id}，回退到全局历史"
+                                        )
+                                        target_topic_id = None
+                            elif not active_topics:
+                                # 无活跃话题：跳过 Topic Selection Gate，沿用全局历史旧逻辑
+                                target_topic_id = None
 
                             if timing_gate_required:
                                 self._runtime._update_stage_status("Timing Gate", "等待门控决策", round_text=round_text)
@@ -458,11 +572,13 @@ class MaisakaReasoningEngine:
                                 f"{self._runtime.log_prefix} 规划器开始执行: "
                                 f"回合={round_index + 1} "
                                 f"历史消息数={len(self._runtime._chat_history)} "
+                                f"target_topic={target_topic_id or 'global'} "
                                 f"开始时间={planner_started_at:.3f}"
                             )
                             response = await self._run_interruptible_planner(
                                 injected_user_messages=[deferred_tools_reminder] if deferred_tools_reminder else None,
                                 tool_definitions=action_tool_definitions,
+                                target_topic_id=target_topic_id,
                             )
                             planner_duration_ms = (time.time() - planner_started_at) * 1000
                             cycle_detail.time_records["planner"] = planner_duration_ms / 1000
@@ -479,6 +595,10 @@ class MaisakaReasoningEngine:
 
                             self._last_reasoning_content = reasoning_content
                             self._runtime._chat_history.append(response.raw_message)
+                            # 阶段一：Planner 思考消息同步到 FALLBACK
+                            self._runtime._topic_manager.assign_message(
+                                TopicManager.FALLBACK_TOPIC_ID, response.raw_message
+                            )
                             tool_monitor_results = []
 
                             if response.tool_calls:
@@ -553,8 +673,8 @@ class MaisakaReasoningEngine:
                             await self._ingest_messages(interrupted_messages)
                             anchor_message = interrupted_messages[-1]
                             logger.info(
-                                f"{self._runtime.log_prefix} 淇濇寔娲昏穬鐘舵€侊紝璺宠繃 Timing Gate 鐩存帴閲嶈瘯 Planner: "
-                                f"鍥炲悎={round_index + 2}"
+                                f"{self._runtime.log_prefix} 保持活跃状态，跳过 Timing Gate 直接重试 Planner: "
+                                f"回合={round_index + 2}"
                             )
                             continue
                         finally:
@@ -684,13 +804,22 @@ class MaisakaReasoningEngine:
         )
 
     async def _ingest_messages(self, messages: list[SessionMessage]) -> None:
-        """处理传入消息列表，将其转换为历史消息并加入聊天历史缓存。"""
+        """处理传入消息列表，将其转换为历史消息并加入聊天历史缓存。
+
+        阶段二：消息入库后，收集本批次 (message_id, history_message) 对，
+        调用话题分类器子代理进行批量分类并分配到具体话题队列。
+        若分类调用失败则优雅降级到 FALLBACK。
+        """
+        # 收集本批次成功构建的 (message_id, history_message) 对
+        batch_entries: List[Tuple[str, LLMContextMessage]] = []
+
         for message in messages:
             history_message = await self._build_history_message(message)
             if history_message is None:
                 continue
 
             self._insert_chat_history_message(history_message)
+            batch_entries.append((message.message_id, history_message))
 
             # 向监控前端广播新消息注入事件
             user_info = message.message_info.user_info
@@ -702,6 +831,499 @@ class MaisakaReasoningEngine:
                 message_id=message.message_id,
                 timestamp=message.timestamp.timestamp(),
             )
+
+        # 批量话题分类
+        if batch_entries:
+            await self._classify_message_topic(batch_entries)
+
+    # ------------------------------------------------------------------
+    # 话题分类器
+    # ------------------------------------------------------------------
+
+    async def _classify_message_topic(
+        self,
+        batch_entries: List[Tuple[str, LLMContextMessage]],
+    ) -> None:
+        """对一批新消息执行话题分类，并分配到对应的话题队列。
+
+        通过 run_sub_agent 调用 LLM 分类器，使用 JSON 格式约束输出。
+        若分类调用失败（异常/超时/解析失败），所有消息降级到 FALLBACK。
+
+        Args:
+            batch_entries: (message_id, history_message) 对的列表。
+        """
+        topic_manager = self._runtime._topic_manager
+
+        try:
+            system_prompt = self._build_topic_classifier_system_prompt(batch_entries)
+            response = await self._runtime.run_sub_agent(
+                context_message_limit=TOPIC_CLASSIFIER_CONTEXT_LIMIT,
+                system_prompt=system_prompt,
+                request_kind="topic_classifier",
+                max_tokens=TOPIC_CLASSIFIER_MAX_TOKENS,
+                response_format=RespFormat(RespFormatType.JSON_OBJ),
+                tool_definitions=[],
+            )
+            raw_text = (response.content or "").strip()
+            classifier_result = parse_classifier_response(raw_text)
+        except Exception as exc:
+            logger.warning(
+                f"{self._runtime.log_prefix} 话题分类器调用失败，所有消息降级到 FALLBACK: {exc}"
+            )
+            # 降级：所有消息走 FALLBACK
+            for _msg_id, history_msg in batch_entries:
+                topic_manager.assign_message(TopicManager.FALLBACK_TOPIC_ID, history_msg)
+            return
+
+        # 构建 message_id -> history_message 的索引
+        message_map: Dict[str, LLMContextMessage] = {
+            msg_id: hist_msg for msg_id, hist_msg in batch_entries
+        }
+        classified_message_ids: set[str] = set()
+
+        # 处理分类结果
+        await self._apply_classifier_result(
+            classifier_result, message_map, classified_message_ids, topic_manager
+        )
+
+        # 未被分类到的消息降级到 FALLBACK
+        for msg_id, hist_msg in batch_entries:
+            if msg_id not in classified_message_ids:
+                logger.debug(
+                    f"{self._runtime.log_prefix} 消息 {msg_id} 未出现在分类结果中，降级到 FALLBACK"
+                )
+                topic_manager.assign_message(TopicManager.FALLBACK_TOPIC_ID, hist_msg)
+
+    async def _apply_classifier_result(
+        self,
+        result: ClassifierResult,
+        message_map: Dict[str, LLMContextMessage],
+        classified_ids: set[str],
+        topic_manager: TopicManager,
+    ) -> None:
+        """将分类器结果应用到话题管理器。
+
+        Args:
+            result: 分类器解析后的结果。
+            message_map: message_id -> history_message 的映射。
+            classified_ids: 已成功分类的消息 ID 集合（会被原地修改）。
+            topic_manager: 话题管理器实例。
+        """
+        # 为 NEW_TOPIC 消息预创建话题队列
+        new_topic_id_by_message: Dict[str, str] = {}
+        for msg_id, summary in result.new_topics.items():
+            new_id = generate_topic_id()
+            try:
+                topic_manager.create_topic(new_id, summary=summary)
+                new_topic_id_by_message[msg_id] = new_id
+                logger.info(
+                    f"{self._runtime.log_prefix} 分类器创建新话题: "
+                    f"topic_id={new_id}, summary={summary!r}, 触发消息={msg_id}"
+                )
+            except ValueError as exc:
+                logger.warning(
+                    f"{self._runtime.log_prefix} 创建新话题失败: {exc}"
+                )
+
+        # 分配每条消息到对应话题
+        for classification in result.classifications:
+            msg_id = classification.message_id
+            target_topic_id = classification.topic_id
+            hist_msg = message_map.get(msg_id)
+            if hist_msg is None:
+                logger.debug(
+                    f"{self._runtime.log_prefix} 分类结果中的消息 {msg_id} 不在当前批次中，跳过"
+                )
+                continue
+
+            # NEW_TOPIC：使用预创建的话题 ID
+            if target_topic_id == NEW_TOPIC_MARKER:
+                actual_topic_id = new_topic_id_by_message.get(msg_id)
+                if actual_topic_id is None:
+                    # 分类器标记为 NEW_TOPIC 但未在 new_topics 中提供摘要，自动补建
+                    actual_topic_id = generate_topic_id()
+                    try:
+                        topic_manager.create_topic(actual_topic_id, summary="新话题")
+                        logger.info(
+                            f"{self._runtime.log_prefix} 自动补建新话题: "
+                            f"topic_id={actual_topic_id}, 消息={msg_id}"
+                        )
+                    except ValueError as exc:
+                        logger.warning(
+                            f"{self._runtime.log_prefix} 自动补建话题失败: {exc}"
+                        )
+                        topic_manager.assign_message(TopicManager.FALLBACK_TOPIC_ID, hist_msg)
+                        classified_ids.add(msg_id)
+                        continue
+                topic_manager.assign_message(actual_topic_id, hist_msg)
+            elif target_topic_id == TopicManager.FALLBACK_TOPIC_ID:
+                # 显式 FALLBACK
+                topic_manager.assign_message(TopicManager.FALLBACK_TOPIC_ID, hist_msg)
+            else:
+                # 现有话题
+                if topic_manager.get_topic(target_topic_id) is None:
+                    logger.warning(
+                        f"{self._runtime.log_prefix} 分类器返回了不存在的话题 {target_topic_id}，"
+                        f"消息 {msg_id} 降级到 FALLBACK"
+                    )
+                    topic_manager.assign_message(TopicManager.FALLBACK_TOPIC_ID, hist_msg)
+                else:
+                    topic_manager.assign_message(target_topic_id, hist_msg)
+
+            classified_ids.add(msg_id)
+            logger.debug(
+                f"{self._runtime.log_prefix} 消息分类完成: "
+                f"msg_id={msg_id}, topic={target_topic_id}, reason={classification.reason!r}"
+            )
+
+        # 更新已有话题的摘要
+        for topic_id, new_summary in result.updated_summaries.items():
+            topic_manager.update_topic_summary(topic_id, new_summary)
+
+        # 阶段四：新话题创建后检查活跃话题数是否超限
+        if new_topic_id_by_message:
+            await self._enforce_topic_queue_limit(topic_manager)
+
+    # ------------------------------------------------------------------
+    # 阶段四：话题队列生命周期管理
+    # ------------------------------------------------------------------
+
+    async def _enforce_topic_queue_limit(self, topic_manager: TopicManager) -> None:
+        """检查活跃话题数是否超过配置上限，超限时 LRU 淘汰最不活跃的话题。
+
+        淘汰流程：总结 -> 持久化到长期记忆 -> 停用 -> 移除。
+        若总结或持久化失败，仅记录警告并继续淘汰下一个。
+
+        Args:
+            topic_manager: 话题管理器实例。
+        """
+        from src.config.config import global_config
+
+        max_active = max(2, int(global_config.chat.max_active_topic_queues))
+
+        while topic_manager.active_topic_count() > max_active:
+            victim = topic_manager.get_least_active_topic()
+            if victim is None:
+                break
+            logger.info(
+                f"{self._runtime.log_prefix} 活跃话题数超过上限 {max_active}，"
+                f"淘汰最不活跃的话题: topic_id={victim.topic_id}, "
+                f"summary={victim.summary!r}"
+            )
+            await self._summarize_and_archive_topic(victim.topic_id, topic_manager)
+
+    async def _summarize_and_archive_topic(
+        self,
+        topic_id: str,
+        topic_manager: TopicManager,
+    ) -> None:
+        """总结并归档指定话题，将摘要持久化到长期记忆后移除队列。
+
+        流程：
+        1. 获取话题的全部消息文本
+        2. 调用 LLM 子代理生成话题总结摘要
+        3. 调用 memory_service.ingest_summary 写入长期记忆
+        4. 停用并移除话题队列
+
+        若 LLM 调用或记忆写入失败，仍会完成停用和移除（仅记录警告），
+        避免故障话题永远无法被清理。
+
+        Args:
+            topic_id: 要归档的话题 ID。
+            topic_manager: 话题管理器实例。
+        """
+        queue = topic_manager.get_topic(topic_id)
+        if queue is None:
+            logger.warning(
+                f"{self._runtime.log_prefix} 尝试归档不存在的话题: topic_id={topic_id}"
+            )
+            return
+
+        # 构建话题消息文本
+        message_texts: List[str] = []
+        first_timestamp: Optional[float] = None
+        last_timestamp: Optional[float] = None
+        for msg in queue.messages:
+            text = (msg.processed_plain_text or "").strip()
+            if text:
+                message_texts.append(text)
+            msg_ts = msg.timestamp.timestamp() if hasattr(msg, "timestamp") else None
+            if msg_ts is not None:
+                if first_timestamp is None:
+                    first_timestamp = msg_ts
+                last_timestamp = msg_ts
+
+        # 生成话题总结摘要
+        summary_text = queue.summary  # 兜底：使用现有摘要
+        if message_texts:
+            try:
+                summary_text = await self._generate_topic_summary(
+                    topic_id=topic_id,
+                    existing_summary=queue.summary,
+                    message_texts=message_texts,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"{self._runtime.log_prefix} 话题总结 LLM 调用失败，"
+                    f"使用现有摘要: topic_id={topic_id}, error={exc}"
+                )
+
+        # 持久化到长期记忆
+        try:
+            result = await memory_service.ingest_summary(
+                external_id=f"topic_archive_{topic_id}",
+                chat_id=self._runtime.session_id,
+                text=summary_text,
+                time_start=first_timestamp,
+                time_end=last_timestamp,
+                tags=["topic_archive", topic_id],
+                metadata={
+                    "topic_id": topic_id,
+                    "original_summary": queue.summary,
+                    "message_count": queue.message_count,
+                },
+            )
+            if result.success:
+                logger.info(
+                    f"{self._runtime.log_prefix} 话题已归档到长期记忆: "
+                    f"topic_id={topic_id}, stored_ids={result.stored_ids}"
+                )
+            else:
+                logger.warning(
+                    f"{self._runtime.log_prefix} 话题归档写入长期记忆失败: "
+                    f"topic_id={topic_id}, detail={result.detail}"
+                )
+        except Exception as exc:
+            logger.warning(
+                f"{self._runtime.log_prefix} 话题归档持久化异常: "
+                f"topic_id={topic_id}, error={exc}"
+            )
+
+        # 停用并移除话题队列
+        topic_manager.deactivate_topic(topic_id)
+        topic_manager.remove_topic(topic_id)
+
+    async def _generate_topic_summary(
+        self,
+        *,
+        topic_id: str,
+        existing_summary: str,
+        message_texts: List[str],
+    ) -> str:
+        """调用 LLM 子代理生成话题总结摘要。
+
+        Args:
+            topic_id: 话题 ID。
+            existing_summary: 现有的话题摘要。
+            message_texts: 话题中的消息文本列表。
+
+        Returns:
+            str: LLM 生成的总结摘要文本。
+        """
+        # 截取最后若干条消息避免 token 过多
+        max_messages_for_summary = 30
+        trimmed_messages = message_texts[-max_messages_for_summary:]
+        messages_section = "\n".join(
+            f"- {text[:200]}" for text in trimmed_messages
+        )
+
+        system_prompt = self._build_topic_summarizer_system_prompt(
+            topic_id=topic_id,
+            existing_summary=existing_summary,
+            messages_section=messages_section,
+        )
+
+        response = await self._runtime.run_sub_agent(
+            context_message_limit=1,
+            system_prompt=system_prompt,
+            request_kind="topic_summarizer",
+            max_tokens=TOPIC_SUMMARIZER_MAX_TOKENS,
+            tool_definitions=[],
+        )
+        raw_text = (response.content or "").strip()
+        if not raw_text:
+            logger.warning(
+                f"{self._runtime.log_prefix} 话题总结器返回空文本，"
+                f"使用现有摘要: topic_id={topic_id}"
+            )
+            return existing_summary
+        return raw_text
+
+    @staticmethod
+    def _build_topic_summarizer_system_prompt(
+        *,
+        topic_id: str,
+        existing_summary: str,
+        messages_section: str,
+    ) -> str:
+        """构造话题总结器的系统提示词。
+
+        Args:
+            topic_id: 话题 ID。
+            existing_summary: 现有的话题摘要。
+            messages_section: 格式化后的消息文本片段。
+
+        Returns:
+            str: 总结器系统提示词。
+        """
+        return (
+            "你是话题总结器。请根据以下聊天消息内容，生成一段简洁的话题总结。\n"
+            "总结应包含话题的核心主题、参与者讨论的要点和结论（如果有的话）。\n"
+            "总结长度控制在 50-150 字之间，使用自然语言描述。\n"
+            "只输出总结文本，不要输出其他内容。\n\n"
+            f"【话题 ID】{topic_id}\n"
+            f"【现有摘要】{existing_summary}\n\n"
+            f"【聊天消息】\n{messages_section}"
+        )
+
+
+    def _build_topic_classifier_system_prompt(
+        self,
+        batch_entries: List[Tuple[str, LLMContextMessage]],
+    ) -> str:
+        """构造话题分类器子代理使用的系统提示词。
+
+        使用 maisaka_topic_classifier 提示词模板，注入当前活跃话题列表
+        和待分类消息的文本内容。模板加载失败时使用内联兜底提示词。
+
+        Args:
+            batch_entries: (message_id, history_message) 对的列表。
+
+        Returns:
+            str: 分类器系统提示词。
+        """
+        topic_manager = self._runtime._topic_manager
+        active_topics_section = topic_manager.get_active_topic_summaries_text()
+
+        # 构造待分类消息文本
+        pending_lines: List[str] = []
+        for msg_id, hist_msg in batch_entries:
+            text = (hist_msg.processed_plain_text or "").strip()
+            if not text:
+                text = "[空消息]"
+            pending_lines.append(f"[{msg_id}] {text}")
+        pending_messages_section = "\n".join(pending_lines)
+
+        try:
+            return load_prompt(
+                "maisaka_topic_classifier",
+                active_topics_section=active_topics_section,
+                pending_messages_section=pending_messages_section,
+            )
+        except Exception:
+            logger.warning(
+                f"{self._runtime.log_prefix} 加载 maisaka_topic_classifier 提示词失败，使用兜底提示词"
+            )
+            return self._build_topic_classifier_fallback_prompt(
+                active_topics_section, pending_messages_section
+            )
+
+    @staticmethod
+    def _build_topic_classifier_fallback_prompt(
+        active_topics_section: str,
+        pending_messages_section: str,
+    ) -> str:
+        """构造话题分类器的兜底提示词。"""
+        return (
+            "你是话题分类器。你的唯一任务是将下面的新消息归类到已有话题，或判定为全新话题。"
+            "请严格按 JSON 格式输出，不要输出 JSON 之外的内容。\n\n"
+            f"【当前活跃话题列表】\n{active_topics_section}\n\n"
+            "【分类规则】\n"
+            "1. 如果消息内容与已有话题高度相关，将其归入对应话题的 topic_id。\n"
+            "2. 如果消息与所有现有话题均不相关，且内容足以开启新话题，返回 \"NEW_TOPIC\"。\n"
+            "3. 如果消息过于零散、无法判定，返回 \"__FALLBACK__\"。\n"
+            "4. 如果某条消息可能同时属于多个话题，优先选择最近活跃的那个。\n"
+            "5. 如果当前没有任何活跃话题，所有有实际内容的消息都应标记为 \"NEW_TOPIC\"。\n\n"
+            f"【待分类消息】\n{pending_messages_section}\n\n"
+            '请以 JSON 格式输出：\n'
+            '{"classifications": {"<msg_id>": {"topic_id": "...", "reason": "..."}}, '
+            '"new_topics": {"<msg_id>": {"summary": "..."}}, '
+            '"updated_summaries": {"<topic_id>": "..."}}'
+        )
+
+    # ------------------------------------------------------------------
+    # Topic Selection Gate（话题兴趣筛选）
+    # ------------------------------------------------------------------
+
+    async def _run_topic_selection_gate(self) -> TopicSelectionResult:
+        """运行 Topic Selection Gate 子代理，基于 Bot 兴趣选择要参与的话题。
+
+        该方法获取所有活跃话题的摘要与最近消息预览，调用 LLM 子代理
+        评估 Bot 最想参与的话题，并返回选择结果。
+
+        当调用失败时优雅降级：返回 topic_id=None（不参与任何话题）。
+
+        Returns:
+            TopicSelectionResult: 包含选中的 topic_id 和理由。
+        """
+        try:
+            system_prompt = self._build_topic_selection_gate_system_prompt()
+            response = await self._runtime.run_sub_agent(
+                context_message_limit=TOPIC_SELECTION_GATE_CONTEXT_LIMIT,
+                system_prompt=system_prompt,
+                request_kind="topic_selection_gate",
+                max_tokens=TOPIC_SELECTION_GATE_MAX_TOKENS,
+                response_format=RespFormat(RespFormatType.JSON_OBJ),
+                tool_definitions=[],
+            )
+            raw_text = (response.content or "").strip()
+            result = parse_topic_selection_response(raw_text)
+            return result
+        except Exception as exc:
+            logger.warning(
+                f"{self._runtime.log_prefix} Topic Selection Gate 调用失败，"
+                f"视为不参与任何话题: {exc}"
+            )
+            return TopicSelectionResult(topic_id=None, reason=f"调用失败: {exc}")
+
+    def _build_topic_selection_gate_system_prompt(self) -> str:
+        """构造 Topic Selection Gate 子代理使用的系统提示词。
+
+        使用 maisaka_topic_selection_gate 提示词模板，注入当前活跃话题列表
+        和各话题最近消息预览。模板加载失败时使用内联兜底提示词。
+
+        Returns:
+            str: Topic Selection Gate 系统提示词。
+        """
+        topic_manager = self._runtime._topic_manager
+        active_topics_section = topic_manager.get_active_topic_summaries_text()
+        topic_previews_section = topic_manager.get_topic_previews_text()
+
+        try:
+            return load_prompt(
+                "maisaka_topic_selection_gate",
+                **self._runtime._chat_loop_service.build_prompt_template_context(),
+                active_topics_section=active_topics_section,
+                topic_previews_section=topic_previews_section,
+            )
+        except Exception:
+            logger.warning(
+                f"{self._runtime.log_prefix} 加载 maisaka_topic_selection_gate "
+                f"提示词失败，使用兜底提示词"
+            )
+            return self._build_topic_selection_gate_fallback_prompt(
+                active_topics_section, topic_previews_section
+            )
+
+    def _build_topic_selection_gate_fallback_prompt(
+        self,
+        active_topics_section: str,
+        topic_previews_section: str,
+    ) -> str:
+        """构造 Topic Selection Gate 的兜底提示词。"""
+        bot_name = self._runtime._chat_loop_service.personality_prompt
+        return (
+            f"你的任务是从当前活跃的话题中，选出你最想参与的一个话题。\n"
+            f"你的人设：{bot_name}\n\n"
+            f"【当前活跃话题列表】\n{active_topics_section}\n\n"
+            f"【各话题最近消息预览】\n{topic_previews_section}\n\n"
+            "【选择规则】\n"
+            "1. 结合你的性格和兴趣，选出一个最想参与互动的话题。\n"
+            "2. 优先选择与你直接相关的话题（如有人正在和你对话、讨论你感兴趣的内容）。\n"
+            "3. 如果所有话题都与你无关，或者当前不适合插话，可以返回 null。\n\n"
+            '请以 JSON 格式输出：\n'
+            '{"topic_id": "<选中的topic_id或null>", "reason": "简短理由"}'
+        )
 
     async def _build_history_message(
         self,
@@ -1186,14 +1808,17 @@ class MaisakaReasoningEngine:
         if not history_content:
             history_content = "工具执行成功。" if result.success else f"工具 {tool_call.func_name} 执行失败。"
 
-        self._runtime._chat_history.append(
-            ToolResultMessage(
-                content=history_content,
-                timestamp=datetime.now(),
-                tool_call_id=tool_call.call_id,
-                tool_name=tool_call.func_name,
-                success=result.success,
-            )
+        tool_result_message = ToolResultMessage(
+            content=history_content,
+            timestamp=datetime.now(),
+            tool_call_id=tool_call.call_id,
+            tool_name=tool_call.func_name,
+            success=result.success,
+        )
+        self._runtime._chat_history.append(tool_result_message)
+        # 阶段一：工具结果同步到 FALLBACK
+        self._runtime._topic_manager.assign_message(
+            TopicManager.FALLBACK_TOPIC_ID, tool_result_message
         )
 
     def _append_timing_gate_execution_result(
@@ -1204,13 +1829,16 @@ class MaisakaReasoningEngine:
     ) -> None:
         """将 Timing Gate 的决策链写入历史，供后续门控复用。"""
 
-        self._runtime._chat_history.append(
-            AssistantMessage(
-                content=response.content or "",
-                timestamp=response.raw_message.timestamp,
-                tool_calls=[tool_call],
-                source_kind="timing_gate",
-            )
+        timing_gate_message = AssistantMessage(
+            content=response.content or "",
+            timestamp=response.raw_message.timestamp,
+            tool_calls=[tool_call],
+            source_kind="timing_gate",
+        )
+        self._runtime._chat_history.append(timing_gate_message)
+        # 阶段一：Timing Gate 决策链同步到 FALLBACK
+        self._runtime._topic_manager.assign_message(
+            TopicManager.FALLBACK_TOPIC_ID, timing_gate_message
         )
         if tool_call.func_name == "wait":
             return
