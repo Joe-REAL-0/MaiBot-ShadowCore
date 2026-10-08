@@ -493,6 +493,8 @@ class ChatBot:
             # 确保所有任务已启动
             await self._ensure_started()
 
+            print(f"原始消息数据: {message_data}")
+
             if message_data["message_info"].get("group_info") is not None:
                 message_data["message_info"]["group_info"]["group_id"] = str(
                     message_data["message_info"]["group_info"]["group_id"]

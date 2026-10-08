@@ -712,6 +712,14 @@ def _build_api_status_message(error: APIStatusError) -> str:
     return f"上游接口返回状态码 {error.status_code}"
 
 
+def _is_role_alternation_template_error(error: APIStatusError) -> bool:
+    """判断是否为上游模板严格要求 user/assistant 交替导致的报错。"""
+    if error.status_code != 400:
+        return False
+    message = _build_api_status_message(error).lower()
+    return "roles must alternate" in message
+
+
 @dataclass(slots=True)
 class _StreamedToolCallState:
     """流式工具调用累积状态。"""
@@ -1148,15 +1156,38 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 "tools": tools_payload,
             }
 
-            if model_info.force_stream_mode:
-                stream_task: asyncio.Task[AsyncStream[ChatCompletionChunk]] = asyncio.create_task(
+            async def _dispatch_with_messages(
+                payload_messages: List[ChatCompletionMessageParam],
+            ) -> Tuple[APIResponse, UsageTuple | None]:
+                if model_info.force_stream_mode:
+                    stream_task: asyncio.Task[AsyncStream[ChatCompletionChunk]] = asyncio.create_task(
+                        self.client.chat.completions.create(
+                            model=model_info.model_identifier,
+                            messages=payload_messages,
+                            tools=tools_payload or omit,
+                            temperature=temperature_argument,
+                            max_tokens=max_tokens_argument,
+                            stream=True,
+                            response_format=openai_response_format,
+                            extra_headers=request_overrides.extra_headers or None,
+                            extra_query=request_overrides.extra_query or None,
+                            extra_body=request_overrides.extra_body or None,
+                        )
+                    )
+                    raw_response = cast(
+                        AsyncStream[ChatCompletionChunk],
+                        await await_task_with_interrupt(stream_task, request.interrupt_flag),
+                    )
+                    return await stream_response_handler(raw_response, request.interrupt_flag)
+
+                completion_task: asyncio.Task[ChatCompletion] = asyncio.create_task(
                     self.client.chat.completions.create(
                         model=model_info.model_identifier,
-                        messages=messages_payload,
+                        messages=payload_messages,
                         tools=tools_payload or omit,
                         temperature=temperature_argument,
                         max_tokens=max_tokens_argument,
-                        stream=True,
+                        stream=False,
                         response_format=openai_response_format,
                         extra_headers=request_overrides.extra_headers or None,
                         extra_query=request_overrides.extra_query or None,
@@ -1164,30 +1195,22 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                     )
                 )
                 raw_response = cast(
-                    AsyncStream[ChatCompletionChunk],
-                    await await_task_with_interrupt(stream_task, request.interrupt_flag),
+                    ChatCompletion,
+                    await await_task_with_interrupt(completion_task, request.interrupt_flag),
                 )
-                return await stream_response_handler(raw_response, request.interrupt_flag)
+                return response_parser(raw_response)
 
-            completion_task: asyncio.Task[ChatCompletion] = asyncio.create_task(
-                self.client.chat.completions.create(
-                    model=model_info.model_identifier,
-                    messages=messages_payload,
-                    tools=tools_payload or omit,
-                    temperature=temperature_argument,
-                    max_tokens=max_tokens_argument,
-                    stream=False,
-                    response_format=openai_response_format,
-                    extra_headers=request_overrides.extra_headers or None,
-                    extra_query=request_overrides.extra_query or None,
-                    extra_body=request_overrides.extra_body or None,
-                )
-            )
-            raw_response = cast(
-                ChatCompletion,
-                await await_task_with_interrupt(completion_task, request.interrupt_flag),
-            )
-            return response_parser(raw_response)
+            try:
+                return await _dispatch_with_messages(messages_payload)
+            except APIStatusError as exc:
+                if not request.tool_options or not _is_role_alternation_template_error(exc):
+                    raise
+
+                logger.warning("检测到上游模板要求 user/assistant 严格交替，已清洗历史工具链并重试一次")
+                fallback_messages = _sanitize_messages_for_toolless_request(list(request.message_list))
+                fallback_payload = _convert_messages(fallback_messages)
+                snapshot_provider_request["request_kwargs"]["messages"] = fallback_payload
+                return await _dispatch_with_messages(fallback_payload)
         except (EmptyResponseException, RespParseException) as exc:
             snapshot_path = save_failed_request_snapshot(
                 api_provider=self.api_provider,

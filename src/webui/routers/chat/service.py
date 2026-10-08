@@ -674,6 +674,7 @@ def create_message_data(
     Returns:
         Dict[str, Any]: 聊天核心可处理的消息数据。
     """
+    print(f"create_message_data: content={content}, user_id={user_id}, user_name={user_name}, message_id={message_id}, is_at_bot={is_at_bot}, virtual_config={virtual_config}")
     if message_id is None:
         message_id = str(uuid.uuid4())
 
@@ -778,6 +779,8 @@ async def handle_chat_message(
         },
     )
 
+    print(f"准备处理消息: content={content}, user_id={sender_user_id}, user_name={sender_name}, message_id={message_id}, is_at_bot=True, virtual_config={current_virtual_config}")
+
     message_data = create_message_data(
         content=content,
         user_id=normalized_user_id,
@@ -786,6 +789,8 @@ async def handle_chat_message(
         is_at_bot=True,
         virtual_config=current_virtual_config,
     )
+
+    print(f"创建消息数据: {message_data}")
 
     try:
         await chat_manager.broadcast_to_group(target_group_id, {"type": "typing", "is_typing": True})
